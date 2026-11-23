@@ -340,7 +340,7 @@ int main(int argc, char** argv) {
         const auto request_id=std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
         if(request.stream) {
             res.set_chunked_content_provider("text/event-stream",
-                [&,ids,budget,chat,model,request_id,think,tools,sampling](size_t,httplib::DataSink& sink) {
+                [&,ids,budget,chat,model,request_id,think,tools,sampling,stops=request.stop](size_t,httplib::DataSink& sink) {
                     auto send=[&](const std::string& payload) {
                         const auto line="data: "+payload+"\n\n";return sink.write(line.data(),line.size());
                     };
@@ -355,16 +355,26 @@ int main(int argc, char** argv) {
                         connected=send(prefix+",\"choices\":[{\"index\":0,"+value+",\"finish_reason\":null}]}");
                         return connected;
                     };
+                    // stop strings: answer text goes through the filter; a match ends the request (cancel at the
+                    // next token, finish_reason "stop")
+                    b70::StopFilter stopper(stops);
+                    auto emit_answer=[&](const std::string& piece,bool reasoning) {
+                        if(reasoning||!stopper.active())return emit(piece,reasoning);
+                        const std::string out=stopper.push(piece);
+                        if(!out.empty()&&!emit(out,false))return false;
+                        return !stopper.hit();
+                    };
                     try {
                         b70::FinishReason finish;
                         std::vector<int32_t> out;
                         int cached=0;
                         const int n=b70::grimoire_scheduler_generate(*sched,ids,budget,
                             tk.eos(),tk.eos2(),out,
-                            [&](int32_t t){return decoder.push(t,emit)&&!g_stop.load();},&finish,sampling,&cached);
-                        if(connected)connected=decoder.finish(emit);
-                        std::string reason=b70::finish_reason_name(finish);
-                        if(connected && !decoder.tool_call_text().empty()) {
+                            [&](int32_t t){return decoder.push(t,emit_answer)&&!g_stop.load();},&finish,sampling,&cached);
+                        if(connected&&!stopper.hit())connected=decoder.finish(emit_answer);
+                        if(connected){const auto rest=stopper.flush();if(!rest.empty())connected=emit(rest,false);}
+                        std::string reason=stopper.hit()?"stop":b70::finish_reason_name(finish);
+                        if(connected && !stopper.hit() && !decoder.tool_call_text().empty()) {
                             const auto calls=b70::parse_xml_tool_calls(decoder.tool_call_text(),tools);
                             if(calls.empty())connected=emit(decoder.tool_call_text(),false);
                             else {
@@ -390,17 +400,22 @@ int main(int argc, char** argv) {
             b70::FinishReason finish;
             std::vector<int32_t> out;
             int cached=0;
-            // a stop ends this request at its next token (the scheduler then cancels the job)
-            const int n=b70::grimoire_scheduler_generate(*sched,ids,budget,tk.eos(),
-                tk.eos2(),out,[](int32_t){return !g_stop.load();},&finish,sampling,&cached);
             std::string content,reasoning;
             b70::ResponseDecoder decoder(tk,chat&&harmony_model,think);
             if(chat&&!tools.empty())decoder.enable_tools();
-            auto emit=[&](const std::string& p,bool r){(r?reasoning:content)+=p;return true;};
-            for(auto t:out)decoder.push(t,emit);
-            decoder.finish(emit);
-            std::string reason=b70::finish_reason_name(finish), calls_json;
-            if(!decoder.tool_call_text().empty()) {
+            b70::StopFilter stopper(request.stop);
+            auto emit=[&](const std::string& p,bool r){
+                if(r||!stopper.active()){(r?reasoning:content)+=p;return true;}
+                content+=stopper.push(p);return !stopper.hit();
+            };
+            // a server stop ends this request at its next token (the scheduler then cancels the job); so does a
+            // stop string, found by decoding as tokens arrive
+            const int n=b70::grimoire_scheduler_generate(*sched,ids,budget,tk.eos(),
+                tk.eos2(),out,[&](int32_t t){return decoder.push(t,emit)&&!g_stop.load();},&finish,sampling,&cached);
+            if(!stopper.hit())decoder.finish(emit);
+            content+=stopper.flush();
+            std::string reason=stopper.hit()?"stop":b70::finish_reason_name(finish), calls_json;
+            if(!stopper.hit() && !decoder.tool_call_text().empty()) {
                 const auto calls=b70::parse_xml_tool_calls(decoder.tool_call_text(),tools);
                 if(calls.empty())content+=decoder.tool_call_text();
                 else {
