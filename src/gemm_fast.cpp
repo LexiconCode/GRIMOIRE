@@ -3797,11 +3797,17 @@ sycl::event gemm_fast_run(sycl::queue& q, const QuantWeight& w, const sycl_bf16*
     // weight (the dequantize pass, ~160 ms a prompt, and its 2 bytes-a-weight scratch, which the prefill chunk
     // budget pays for) -- the same bf16-rounded weights the bf16 GEMM below multiplies.  GRIMOIRE_I4_ONEDNN_PROMPT=0
     // = the paths below.  GRIMOIRE_I4A8=1 (opt-in) keeps priority.
-    // Up to GRIMOIRE_I4_ONEDNN_PROMPT_MAX rows (512; 0 = off): the dequantize pass costs the same at any M, oneDNN's
-    // GEMM is slower than the bf16 one at prompt sizes.  MEASURED 2026-11-14, one B70, Swift INT4, TTFT: 4 x 60-token
-    // prompts admitted together (240 rows) 320 -> 229 ms; 2.2K / 1.3K-token prompts 1,213 / 789 -> 1,446 / 830 ms.
+    // Up to GRIMOIRE_I4_ONEDNN_PROMPT_MAX rows (1535, i.e. every INT4 prompt GEMM below I4A8's 1536 rows; 0 = off):
+    // oneDNN dequantizes inside the GEMM, the bf16 path below runs a separate dequantize pass of the whole weight on
+    // every call (dequant_int4_stream4: 17% of device time on a short-prompt / 4-user workload, unitrace) -- and an
+    // interleaved prompt chunk (1024 rows) lands in that band on every chunk and layer.  MEASURED 2026-11-14 (limit
+    // 512): 4 x 60-token prompts admitted together (240 rows) 320 -> 229 ms; then 2.2K / 1.3K-token prompts were
+    // slower through oneDNN (1,213 / 789 -> 1,446 / 830 ms).  MEASURED 2026-11-23, image oneDNN 3.14, one B70, Swift
+    // INT4 + MTP K6, 512 -> 1535: first token for 512 / 1,024 / 2,048-token prompts 501 / 742 / 997 -> 372 / 713 /
+    // 1,012 ms; pp4096 at 2 / 4 / 8 users 1,943 / 1,922 / 1,946 -> 2,094 / 2,012 / 2,027 tok/s; single prompts
+    // 16K-64K unchanged (I4A8 takes their chunks).  Same arithmetic class as before (bf16-rounded weights).
     static const int i4_dnnl_prompt_max = [] { const char* e = std::getenv("GRIMOIRE_I4_ONEDNN_PROMPT_MAX");
-        return e && *e ? std::atoi(e) : 512; }();
+        return e && *e ? std::atoi(e) : 1535; }();
     // GRIMOIRE_I4A8G=<32|64|128> (opt-in, onednn_gemm.cpp): the INT4 prompt GEMMs I4A8 does not take (17 to
     // 1535 rows: interleaved prompt chunks, admission batches, short prompts) as int8 activations with group
     // scales x the INT4 weights as stored, instead of bf16.  MEASURED 2026-11-22, one B70, Swift INT4 + MTP K6,
