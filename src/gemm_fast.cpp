@@ -3811,7 +3811,8 @@ sycl::event gemm_fast_run(sycl::queue& q, const QuantWeight& w, const sycl_bf16*
     const bool i4a8_takes = i4a8_ok(w, M);
     // (the cheap shape tests first: decode GEMMs, M <= 16, never reach the once-per-shape check)
     const bool a8g = M > 16 && w.N >= 2048 && w.fmt == Fmt::INT4 && !i4a8_takes && onednn_i4a8g_group() > 0 &&
-                     w.K % onednn_i4a8g_group() == 0 && onednn_int4_a8g_ok(q, w, EPI == 2);
+                     w.K % onednn_i4a8g_group() == 0 &&
+                     onednn_int4_a8g_ok(q, w, EPI == 2, M, EPI == 1 ? 512 : 0);   // 512: the SwiGLU row chunk below
     if ((M <= i4_dnnl_prompt_max || a8g) && w.fmt == Fmt::INT4 && M > 16 && w.N >= 2048 &&
         !i4a8_takes && onednn_int4_ok(q, w, M)) {
         auto* const i4gemm = a8g ? &onednn_gemm_int4_a8g : &onednn_gemm_int4;
