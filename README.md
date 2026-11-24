@@ -79,6 +79,11 @@ MTP head drafts for all users in one pass (main): with 2 / 4 / 8 users speculati
 +16% on two cards and +14% at 4 users on one card (llama-benchy), answers identical to drafting
 one user at a time (`GRIMOIRE_MTP_BATCH_DRAFT=0`).
 
+`GRIMOIRE_TP_INTERLEAVE=1` (opt-in) reads a long prompt on two cards in 1,024-token chunks with the other
+users' decoding in between: their pauses during a 32K / 60K prompt fall from 17 / 33 s to ~1.3 s, and that
+prompt's own first token comes about twice as late.  Reading in chunks takes different GEMM paths, so its answer
+can differ in wording from the one-pass answer; with the switch off, output is unchanged.
+
 **Run the official FP8 checkpoint with `--proj int8`** (since v1.10.1; the older v1.10.0 image
 runs INT8 slower, use `--proj fp8` with that one): it is closer to
 the original model -- top-1 agreement with the BF16 original 98.0% against 94.9% with `--proj fp8`
@@ -343,7 +348,8 @@ one conversation slot, 262,144-token context, llama-benchy 0.4.0, the v1.10.6 re
 **What v1.10.6 changes:**
 
 - MTP drafts for up to 8 users at once; a verify pass holds at most 16 rows (`GRIMOIRE_SPEC_ROWS`); two users
-  draft 5 tokens deep (`GRIMOIRE_SPEC_DEPTHS`, default `15,5`).
+  draft 5 tokens deep (`GRIMOIRE_SPEC_DEPTHS`, default `15,5`; on one card now `15,3`, two-card / pipeline
+  runs keep `15,5`; an explicit `GRIMOIRE_SPEC_DEPTHS` sets both).
 - Sampled requests (temperature > 0) are admitted together, so several users get their first token sooner.
 - INT4 prompts up to 160 rows run in 32-row INT4 pieces (about half the time to first token on short prompts);
   opt-in `GRIMOIRE_I4A8=1` uses 8-bit activations for long INT4 prompts (+14-22% prefill, lossy).
@@ -510,10 +516,14 @@ at 2 or more, or disable MTP.
   `content` (`chat_template_kwargs: {"enable_thinking": false}` turns thinking off).
 - A long prompt that arrives while other requests are decoding is processed in chunks of 1,024
   tokens with the others' decoding in between (`GRIMOIRE_INTERLEAVE_CHUNK`, 0 = off): the others
-  pause for ~0.6 s at a time instead of ~2 s for a 4K prompt.
-- Opt-in, not measured yet: `-e GRIMOIRE_PREFIX_SHARED=1` (one GPU, Qwen3.5 / 3.8 dense, 2+ slots) lets agents that
+  pause for ~0.6 s at a time instead of ~2 s for a 4K prompt.  Sampled requests (temperature > 0) are read
+  in chunks too (`GRIMOIRE_INTERLEAVE_SAMPLED=0` = one pass, as before): the chunks take different GEMM paths,
+  so a sampled answer can differ from the one-pass answer for the same seed and prompt.
+- Opt-in: `-e GRIMOIRE_PREFIX_SHARED=1` (one GPU, Qwen3.5 / 3.8 dense, 2+ slots) lets agents that
   share a long system prompt (2,048 tokens or more, `GRIMOIRE_PREFIX_SHARED_MIN`) read it once: a new conversation
   copies another slot's cache up to the end of the system message, even while that slot is still answering.
+  Measured on one B70 (Swift INT4 + MTP): 4 agents with a 30K-token system prompt, last agent's first token
+  113 -> 13 s; the copied start answers byte-identically to reading the prompt itself.
 
 ### Models, downloads, launch flags and measured speed
 

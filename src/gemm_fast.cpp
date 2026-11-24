@@ -3803,9 +3803,11 @@ sycl::event gemm_fast_run(sycl::queue& q, const QuantWeight& w, const sycl_bf16*
     // interleaved prompt chunk (1024 rows) lands in that band on every chunk and layer.  MEASURED 2026-11-14 (limit
     // 512): 4 x 60-token prompts admitted together (240 rows) 320 -> 229 ms; then 2.2K / 1.3K-token prompts were
     // slower through oneDNN (1,213 / 789 -> 1,446 / 830 ms).  MEASURED 2026-11-23, image oneDNN 3.14, one B70, Swift
-    // INT4 + MTP K6, 512 -> 1535: first token for 512 / 1,024 / 2,048-token prompts 501 / 742 / 997 -> 372 / 713 /
-    // 1,012 ms; pp4096 at 2 / 4 / 8 users 1,943 / 1,922 / 1,946 -> 2,094 / 2,012 / 2,027 tok/s; single prompts
-    // 16K-64K unchanged (I4A8 takes their chunks).  Same arithmetic class as before (bf16-rounded weights).
+    // INT4 + MTP K6, 512 -> 1535: first token for 512 / 1,024-token prompts 501 / 742 -> 372 / 713 ms (2,048: 997 ->
+    // 1,012 ms, run noise -- I4A8 takes those rows, this limit does not touch them); pp4096 at 2 / 4 / 8 users
+    // 1,943 / 1,922 / 1,946 -> 2,094 / 2,012 / 2,027 tok/s; single prompts 16K-64K unchanged.  Same weights
+    // (bf16-rounded), different summation order, so not byte-identical: KL of the next-token distribution against
+    // the 512 limit, 1,024-token prompts, 160 positions: book 0.00016, code 0.00049 (top-1 equal 97.5 / 99.4%).
     static const int i4_dnnl_prompt_max = [] { const char* e = std::getenv("GRIMOIRE_I4_ONEDNN_PROMPT_MAX");
         return e && *e ? std::atoi(e) : 1535; }();
     // GRIMOIRE_I4A8G=<32|64|128> (opt-in, onednn_gemm.cpp): the INT4 prompt GEMMs I4A8 does not take (17 to
@@ -3817,7 +3819,8 @@ sycl::event gemm_fast_run(sycl::queue& q, const QuantWeight& w, const sycl_bf16*
     const bool i4a8_takes = i4a8_ok(w, M);
     // (the cheap shape tests first: decode GEMMs, M <= 16, never reach the once-per-shape check)
     const bool a8g = M > 16 && w.N >= 2048 && w.fmt == Fmt::INT4 && !i4a8_takes && onednn_i4a8g_group() > 0 &&
-                     w.K % onednn_i4a8g_group() == 0 && onednn_int4_a8g_ok(q, w, EPI == 2);
+                     w.K % onednn_i4a8g_group() == 0 &&
+                     onednn_int4_a8g_ok(q, w, EPI == 2, M, EPI == 1 ? 512 : 0);   // 512: the SwiGLU row chunk below
     if ((M <= i4_dnnl_prompt_max || a8g) && w.fmt == Fmt::INT4 && M > 16 && w.N >= 2048 &&
         !i4a8_takes && onednn_int4_ok(q, w, M)) {
         auto* const i4gemm = a8g ? &onednn_gemm_int4_a8g : &onednn_gemm_int4;

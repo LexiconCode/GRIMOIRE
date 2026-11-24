@@ -564,29 +564,45 @@ int onednn_i4a8g_group() {
     return g;
 }
 
-// Whether this weight's grouped primitives are fast kernels on this GPU / oneDNN, checked once per shape (and
-// accumulate mode) before any of its work is enqueued, on the smallest and largest piece: where oneDNN offers only
-// the reference kernel, the shape keeps its previous path.  The other piece sizes are built on first use, as in
-// onednn_gemm_int4 (building all six here would add ~2 s of primitive creation to the first prompt).
-bool onednn_int4_a8g_ok(sycl::queue& q, const QuantWeight& w, bool accumulate) {
+namespace {
+// The piece sizes onednn_gemm_int4_a8g runs (its tail rows run as one 32-row piece), as bits of kPiecesG.
+constexpr int kPiecesG[] = {1024, 512, 256, 128, 64, 32};
+unsigned a8g_pieces(int M) {
+    unsigned bits = 0;
+    int r0 = 0;
+    for (int i = 0; i < 6; ++i)
+        while (M - r0 >= kPiecesG[i]) { bits |= 1u << i; r0 += kPiecesG[i]; }
+    if (M > r0) bits |= 1u << 5;
+    return bits;
+}
+} // namespace
+
+// Whether every piece primitive a call of M rows (made in calls of at most `chunk` rows; 0 = one call) runs is a
+// fast kernel on this GPU / oneDNN, checked BEFORE any of its work is enqueued: where oneDNN offers only the
+// reference kernel for a piece, the shape keeps its previous path for good (a piece refused mid-call would fail
+// the request with the output half written).  Pieces are built on first need, so a short first prompt does not
+// pay for all six (~2 s of primitive creation).
+bool onednn_int4_a8g_ok(sycl::queue& q, const QuantWeight& w, bool accumulate, int M, int chunk) {
     const int ga = onednn_i4a8g_group();
-    if (ga == 0 || w.K % ga != 0 || !onednn_int4_ok(q, w, 32)) return false;
-    static std::map<std::tuple<int, int, int, int>, bool> seen;
+    if (ga == 0 || w.K % ga != 0 || M <= 0 || !onednn_int4_ok(q, w, 32)) return false;
+    static std::map<std::tuple<int, int, int, int>, unsigned> built;   // pieces built per shape; ~0u = refused
     std::lock_guard<std::mutex> lk(mu());
-    const auto k = std::make_tuple(w.N, w.K, i4_group(w), accumulate ? 1 : 0);
-    auto it = seen.find(k);
-    if (it != seen.end()) return it->second;
-    bool ok = true;
+    unsigned& have = built[std::make_tuple(w.N, w.K, i4_group(w), accumulate ? 1 : 0)];
+    if (have == ~0u) return false;
+    const unsigned need = chunk > 0 && M > chunk ? a8g_pieces(chunk) | a8g_pieces(M % chunk) : a8g_pieces(M);
     try {
         Ctx& c = ctx_for(q);
-        for (const int P : {32, 1024})
-            (void)i4g_prim(c, q, w, P, ga, accumulate);
+        for (int i = 0; i < 6; ++i)
+            if (need & ~have & (1u << i)) {
+                (void)i4g_prim(c, q, w, kPiecesG[i], ga, accumulate);
+                have |= 1u << i;
+            }
     } catch (const std::exception& ex) {
-        ok = false;
+        have = ~0u;
         std::fprintf(stderr, "  i4a8g off for N=%d K=%d (%s); this shape keeps the bf16 / INT4 path\n", w.N, w.K, ex.what());
+        return false;
     }
-    seen.emplace(k, ok);
-    return ok;
+    return true;
 }
 
 sycl::event onednn_gemm_int4_a8g(sycl::queue& q, const QuantWeight& w, const sycl_bf16* x, float* y, int M,
@@ -626,7 +642,6 @@ sycl::event onednn_gemm_int4_a8g(sycl::queue& q, const QuantWeight& w, const syc
     // The same fixed pieces as onednn_gemm_int4, so a new prompt length builds no primitive.  The tail runs
     // as a 32-row primitive over the int8 rows past M (the buffers are padded to whole 32-row pieces; those
     // rows hold earlier values, and their output rows are never copied out), its output staged.
-    static constexpr int kPiecesG[] = {1024, 512, 256, 128, 64, 32};
     std::vector<sycl::event> d = {e};
     int r0 = 0;
     for (const int P : kPiecesG)

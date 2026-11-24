@@ -62,8 +62,9 @@ sycl::event onednn_gemm_int4(sycl::queue& q, const QuantWeight& w, const sycl_bf
 // 32 = 0.0005-0.0017 (I4A8, the default int8 path at >= 1536 rows: 0.0013 / 0.0034); first token at 512 / 1024
 // tokens 255 / 455 ms (128), 281 / 519 (64), 351 / 643 (32), against 501 / 742 on the bf16 path.
 int onednn_i4a8g_group();
-// Every primitive the grouped path needs for this weight is a fast kernel (checked once per shape).
-bool onednn_int4_a8g_ok(sycl::queue& q, const QuantWeight& w, bool accumulate);
+// Every piece primitive a call of M rows (in calls of at most `chunk` rows, 0 = one call) needs for this weight is
+// a fast kernel (built and checked before the call; a refused piece turns the shape off).
+bool onednn_int4_a8g_ok(sycl::queue& q, const QuantWeight& w, bool accumulate, int M, int chunk = 0);
 sycl::event onednn_gemm_int4_a8g(sycl::queue& q, const QuantWeight& w, const sycl_bf16* x, float* y, int M,
                                  bool accumulate, const std::vector<sycl::event>& deps = {});
 
