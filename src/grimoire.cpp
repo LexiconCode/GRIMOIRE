@@ -10421,7 +10421,7 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& requested_opt,
     // Swift INT4, 1 slot, ~4K-token prompts one at a time -- the first 3.73 s, the same length again 1.62 s; unitrace:
     // 336 weights, i4a8_scales 1.70 s.  The same scales, computed here instead; answers unchanged.  One card only
     // (TP / PP ranks convert their weights per chunk on their own queues).
-    if (!tp_enabled() && !pp_enabled()) {
+    if (!tp_ranked() && !pp_enabled()) {   // tp_ranked: both TP modes (tp_enabled() is false under Megatron TP)
         const auto t0 = std::chrono::steady_clock::now();
         int n = 0;
         auto prep = [&](sycl::queue& lq, const DevQuant& w) { n += gemm_fast_i4a8_prepare(lq, w.w); };
